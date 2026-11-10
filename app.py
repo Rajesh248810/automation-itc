@@ -12,8 +12,42 @@ from playwright.sync_api import sync_playwright
 app = Flask(__name__)
 
 # Temporary active session storage
-# active_sessions[mobile] = { userKey, dataKey, turnstileToken, ... }
+# active_sessions[userKey] = { userKey, dataKey, spinTurnstileToken, mobile }
 active_sessions = {}
+
+def fetch_fresh_turnstile():
+    print("[ENGINE] Spawning quick headless helper to fetch fresh Turnstile token...")
+    token = None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                channel="chrome",
+                headless=False,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--window-position=-2400,-2400",
+                    "--window-size=430,932"
+                ]
+            )
+            context = browser.new_context(
+                viewport={"width": 430, "height": 932},
+                is_mobile=True,
+                user_agent="Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"
+            )
+            page = context.new_page()
+            page.add_init_script("delete Object.getPrototypeOf(navigator).webdriver")
+            page.goto("https://discoverworldblends.in/", wait_until="domcontentloaded")
+            ts = page.locator("input[name='cf-turnstile-response']")
+            for _ in range(25):
+                val = ts.input_value()
+                if val and len(val) > 20:
+                    token = val
+                    break
+                time.sleep(0.5)
+            browser.close()
+    except Exception as e:
+        print(f"[ENGINE] Fallback Turnstile error: {e}")
+    return token
 
 # ================= CRYPTO & API HELPERS =================
 def encrypt_payload(user_key, data_key, payload_obj):
@@ -143,6 +177,19 @@ def trigger_campaign_otp(mobile, name="Rahul Sharma", pincode="110001"):
             print(f"[ENGINE] Register API direct response: {dec}")
             if dec.get("statusCode") == 200:
                 captured["otpSent"] = True
+                # Immediately pre-fetch a fresh Turnstile token for the reward wheel!
+                print("[ENGINE] Pre-fetching fresh Turnstile token for wheel spin...")
+                try:
+                    page.evaluate("window.turnstile.reset()")
+                    for _ in range(15):
+                        new_val = ts_elem.input_value()
+                        if new_val and new_val != captured["turnstileToken"]:
+                            captured["spinTurnstileToken"] = new_val
+                            print(f"[ENGINE] Fresh Spin Turnstile Token ready: {new_val[:30]}...")
+                            break
+                        time.sleep(0.5)
+                except Exception as ex:
+                    print(f"[ENGINE] Spin token pre-fetch error: {ex}")
             else:
                 captured["error"] = dec.get("message", "Registration rejected")
         except Exception as e:
@@ -153,17 +200,22 @@ def trigger_campaign_otp(mobile, name="Rahul Sharma", pincode="110001"):
         browser.close()
 
     if captured["otpSent"] and captured["userKey"]:
-        active_sessions[mobile] = {
+        session_data = {
             "userKey": captured["userKey"],
             "dataKey": captured["dataKey"],
             "turnstileToken": captured["turnstileToken"],
+            "spinTurnstileToken": captured.get("spinTurnstileToken"),
             "mobile": mobile
         }
+        active_sessions[str(captured["userKey"])] = session_data
+        active_sessions[str(mobile)] = session_data
+
         return {
             "success": True,
             "userKey": captured["userKey"],
             "dataKey": captured["dataKey"],
             "turnstileToken": captured["turnstileToken"],
+            "spinTurnstileToken": captured.get("spinTurnstileToken"),
             "mobile": mobile,
             "message": "OTP sent successfully!"
         }
@@ -237,12 +289,32 @@ def api_verify_and_spin():
     ans_url = f"https://discoverworldblends.in/api/users/answer/{user_key}?t={int(time.time()*1000)}"
     requests.post(ans_url, data=ans_enc, headers=auth_headers, timeout=15)
 
-    # 4. Spin (getReward)
-    spin_token = turnstile_token if turnstile_token else "direct_spin_token"
+    # 4. Spin (getReward) with fresh Turnstile token
+    session_data = active_sessions.get(str(user_key)) or {}
+    spin_token = session_data.get("spinTurnstileToken") or data.get("spinTurnstileToken")
+    
+    if not spin_token:
+        print("[API] Spin token not in memory, fetching fresh Turnstile token...")
+        spin_token = fetch_fresh_turnstile()
+
+    if not spin_token:
+        spin_token = turnstile_token or "direct_spin_token"
+
+    print(f"[API] Submitting getReward with fresh Turnstile token: {spin_token[:30]}...")
     spin_enc = encrypt_payload(user_key, data_key, {"token": spin_token})
     spin_url = f"https://discoverworldblends.in/api/users/getReward/{user_key}?t={int(time.time()*1000)}"
     spin_res = requests.post(spin_url, data=spin_enc, headers=auth_headers, timeout=15)
     spin_data = decode_resp(spin_res.text)
+    print(f"[API] getReward response: {spin_data}")
+
+    # Log won vouchers
+    try:
+        reward_type = spin_data.get("rewardType", "")
+        if spin_data.get("isWinner") or any(k in reward_type.upper() for k in ["SWIGGY", "BOOKMYSHOW", "VOUCHER", "WINNER"]):
+            with open("vouchers_won.txt", "a", encoding="utf-8") as vf:
+                vf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] UserKey: {user_key} | Reward: {reward_type} | Data: {json.dumps(spin_data)}\n")
+    except Exception:
+        pass
 
     return jsonify({
         "success": True,
@@ -482,7 +554,8 @@ HTML_TEMPLATE = """
             userKey: currentSession.userKey,
             dataKey: currentSession.dataKey,
             otp: otp,
-            turnstileToken: currentSession.turnstileToken
+            turnstileToken: currentSession.turnstileToken,
+            spinTurnstileToken: currentSession.spinTurnstileToken
           })
         });
         const data = await res.json();
