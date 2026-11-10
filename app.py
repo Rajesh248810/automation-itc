@@ -11,7 +11,8 @@ from playwright.sync_api import sync_playwright
 
 app = Flask(__name__)
 
-# In-memory session tracking
+# Temporary active session storage
+# active_sessions[mobile] = { userKey, dataKey, turnstileToken, ... }
 active_sessions = {}
 
 # ================= CRYPTO & API HELPERS =================
@@ -53,8 +54,8 @@ def decode_resp(text):
         return {"raw": text}
 
 # ================= AUTOMATION ENGINE =================
-def trigger_campaign_otp(mobile, name="User", pincode="110001"):
-    print(f"[ENGINE] Starting automated Chrome session for +91 {mobile}...")
+def trigger_campaign_otp(mobile, name="Rahul Sharma", pincode="110001"):
+    print(f"[ENGINE] Starting automated Chrome session for {mobile}...")
     captured = {
         "userKey": None,
         "dataKey": None,
@@ -81,22 +82,31 @@ def trigger_campaign_otp(mobile, name="User", pincode="110001"):
         page = context.new_page()
         page.add_init_script("delete Object.getPrototypeOf(navigator).webdriver")
 
-        # Network interceptor to capture assigned userKey and dataKey
+        # Network interceptor to capture keys and confirmation
         def on_res(res):
             try:
                 if "/api/collect" in res.url:
                     dec = decode_resp(res.text())
                     captured["userKey"] = dec.get("userKey")
                     captured["dataKey"] = dec.get("dataKey")
-            except Exception:
+                    print(f"[ENGINE] Captured session: userKey={captured['userKey']}")
+                elif "/api/users/register/" in res.url:
+                    dec = decode_resp(res.text())
+                    print(f"[ENGINE] Register API response: {dec}")
+                    if dec.get("statusCode") == 200:
+                        captured["otpSent"] = True
+                    else:
+                        captured["error"] = dec.get("message", "Registration rejected")
+            except Exception as e:
                 pass
 
         page.on("response", on_res)
 
+        print("[ENGINE] Navigating to https://discoverworldblends.in/...")
         page.goto("https://discoverworldblends.in/", wait_until="load")
         time.sleep(2)
 
-        # Fill inputs
+        print(f"[ENGINE] Entering details for {mobile}...")
         page.locator("input[placeholder='Name*']").fill(name)
         page.locator("input[placeholder='Mobile Number*']").fill(mobile)
         pin_input = page.locator("input[placeholder='Pincode*']")
@@ -111,12 +121,12 @@ def trigger_campaign_otp(mobile, name="User", pincode="110001"):
         btn = page.locator("button:has-text('Get Discover Code')")
         ts_elem = page.locator("input[name='cf-turnstile-response']")
 
-        print("[ENGINE] Waiting for Cloudflare Turnstile token...")
+        print("[ENGINE] Waiting for Cloudflare Turnstile verification...")
         for i in range(30):
             val = ts_elem.input_value()
             if val and not btn.is_disabled():
                 captured["turnstileToken"] = val
-                print(f"[ENGINE] Turnstile verified in {i+1}s!")
+                print(f"[ENGINE] Turnstile verified in {i+1}s! Token: {val[:30]}...")
                 break
             time.sleep(1)
 
@@ -124,13 +134,13 @@ def trigger_campaign_otp(mobile, name="User", pincode="110001"):
             browser.close()
             return {"success": False, "error": "Cloudflare Turnstile verification timeout"}
 
-        print("[ENGINE] Submitting registration form...")
+        print("[ENGINE] Submitting form (clicking Get Discover Code)...")
         try:
             with page.expect_response(lambda res: "/api/users/register/" in res.url, timeout=15000) as response_info:
                 btn.click()
             reg_res = response_info.value
             dec = decode_resp(reg_res.text())
-            print(f"[ENGINE] Register response: {dec}")
+            print(f"[ENGINE] Register API direct response: {dec}")
             if dec.get("statusCode") == 200:
                 captured["otpSent"] = True
             else:
@@ -138,7 +148,7 @@ def trigger_campaign_otp(mobile, name="User", pincode="110001"):
         except Exception as e:
             print(f"[ENGINE] Submit response error: {e}")
             captured["error"] = "Registration request timed out. Please retry."
-
+        
         time.sleep(1)
         browser.close()
 
@@ -173,7 +183,7 @@ def api_request_otp():
     try:
         data = request.json or {}
         mobile = str(data.get("mobile", "")).strip()
-        name = str(data.get("name", "User")).strip()
+        name = str(data.get("name", "Rahul Sharma")).strip()
         pincode = str(data.get("pincode", "110001")).strip()
 
         if not mobile or len(mobile) != 10:
@@ -190,58 +200,54 @@ def api_request_otp():
 
 @app.route("/api/verify-and-spin", methods=["POST"])
 def api_verify_and_spin():
-    try:
-        data = request.json or {}
-        user_key = data.get("userKey")
-        data_key = data.get("dataKey")
-        otp = str(data.get("otp", "")).strip().upper()
-        turnstile_token = data.get("turnstileToken", "")
-        country = data.get("country", "brazil")
+    data = request.json or {}
+    user_key = data.get("userKey")
+    data_key = data.get("dataKey")
+    otp = str(data.get("otp", "")).strip().upper()
+    turnstile_token = data.get("turnstileToken", "")
+    country = data.get("country", "brazil")
 
-        if not user_key or not data_key or not otp:
-            return jsonify({"success": False, "error": "Missing session parameters or OTP"}), 400
+    if not user_key or not data_key or not otp:
+        return jsonify({"success": False, "error": "Missing session parameters or OTP"}), 400
 
-        print(f"[API] Verifying OTP {otp} for userKey {user_key}...")
+    print(f"[API] Verifying OTP {otp} for userKey {user_key}...")
 
-        # 1. Verify OTP
-        v_enc = encrypt_payload(user_key, data_key, {"otp": otp})
-        v_url = f"https://discoverworldblends.in/api/users/verifyOTP/{user_key}?t={int(time.time()*1000)}"
-        v_res = requests.post(v_url, data=v_enc, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=15)
-        v_data = decode_resp(v_res.text)
+    # 1. Verify OTP
+    v_enc = encrypt_payload(user_key, data_key, {"otp": otp})
+    v_url = f"https://discoverworldblends.in/api/users/verifyOTP/{user_key}?t={int(time.time()*1000)}"
+    v_res = requests.post(v_url, data=v_enc, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=15)
+    v_data = decode_resp(v_res.text)
 
-        access_token = v_data.get("accessToken")
-        if not access_token:
-            return jsonify({"success": False, "error": v_data.get("message", "Invalid OTP"), "details": v_data}), 400
+    access_token = v_data.get("accessToken")
+    if not access_token:
+        return jsonify({"success": False, "error": v_data.get("message", "Invalid OTP"), "details": v_data}), 400
 
-        auth_headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/x-www-form-urlencoded"
-        }
+    auth_headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
 
-        # 2. Select Country
-        sc_enc = encrypt_payload(user_key, data_key, {"country": country})
-        sc_url = f"https://discoverworldblends.in/api/users/selectCountry/{user_key}?t={int(time.time()*1000)}"
-        requests.post(sc_url, data=sc_enc, headers=auth_headers, timeout=15)
+    # 2. Select Country
+    sc_enc = encrypt_payload(user_key, data_key, {"country": country})
+    sc_url = f"https://discoverworldblends.in/api/users/selectCountry/{user_key}?t={int(time.time()*1000)}"
+    requests.post(sc_url, data=sc_enc, headers=auth_headers, timeout=15)
 
-        # 3. Answer AR Quiz
-        ans_enc = encrypt_payload(user_key, data_key, {"answer": "Rich, smooth and aromatic authentic coffee blend with distinct notes"})
-        ans_url = f"https://discoverworldblends.in/api/users/answer/{user_key}?t={int(time.time()*1000)}"
-        requests.post(ans_url, data=ans_enc, headers=auth_headers, timeout=15)
+    # 3. Answer AR Quiz
+    ans_enc = encrypt_payload(user_key, data_key, {"answer": "Rich, smooth and aromatic authentic coffee blend with distinct notes"})
+    ans_url = f"https://discoverworldblends.in/api/users/answer/{user_key}?t={int(time.time()*1000)}"
+    requests.post(ans_url, data=ans_enc, headers=auth_headers, timeout=15)
 
-        # 4. Spin (getReward)
-        spin_token = turnstile_token if turnstile_token else "direct_spin_token"
-        spin_enc = encrypt_payload(user_key, data_key, {"token": spin_token})
-        spin_url = f"https://discoverworldblends.in/api/users/getReward/{user_key}?t={int(time.time()*1000)}"
-        spin_res = requests.post(spin_url, data=spin_enc, headers=auth_headers, timeout=15)
-        spin_data = decode_resp(spin_res.text)
+    # 4. Spin (getReward)
+    spin_token = turnstile_token if turnstile_token else "direct_spin_token"
+    spin_enc = encrypt_payload(user_key, data_key, {"token": spin_token})
+    spin_url = f"https://discoverworldblends.in/api/users/getReward/{user_key}?t={int(time.time()*1000)}"
+    spin_res = requests.post(spin_url, data=spin_enc, headers=auth_headers, timeout=15)
+    spin_data = decode_resp(spin_res.text)
 
-        return jsonify({
-            "success": True,
-            "spinResult": spin_data
-        })
-    except Exception as e:
-        print(f"[API ERROR] {e}")
-        return jsonify({"success": False, "error": f"Verification error: {str(e)}"}), 500
+    return jsonify({
+        "success": True,
+        "spinResult": spin_data
+    })
 
 # ================= DASHBOARD UI =================
 HTML_TEMPLATE = """
@@ -268,7 +274,7 @@ HTML_TEMPLATE = """
         DISCOVER WORLD BLENDS CAMPAIGN BOT
       </div>
       <h1 class="text-2xl font-bold tracking-tight">Campaign Automation Dashboard</h1>
-      <p class="text-xs text-slate-400">Enter mobile number, request OTP, and the pipeline will automatically verify, answer AR quiz, and spin the wheel.</p>
+      <p class="text-xs text-slate-400">नंबर डालें, OTP रिक्वेस्ट करें, और बाकी सारा प्रोसेस (OTP Verify, Answer, Wheel Spin) अपने आप होगा।</p>
     </div>
 
     <!-- Step 1: Request OTP -->
@@ -277,21 +283,31 @@ HTML_TEMPLATE = """
         <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">10-Digit Mobile Number</label>
         <div class="relative">
           <span class="absolute left-4 top-3.5 text-slate-400 text-sm font-semibold">+91</span>
-          <input type="tel" id="mobile-input" value="" maxlength="10" placeholder="Enter 10-digit number"
+          <input type="tel" id="mobile-input" value="" maxlength="10" placeholder="10-digit number"
             class="w-full pl-14 pr-4 py-3 bg-slate-950 border border-slate-800 rounded-xl text-base font-semibold focus:outline-none focus:border-emerald-500 text-white placeholder-slate-600 transition">
         </div>
       </div>
 
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="block text-xs text-slate-400 mb-1">Name (Optional)</label>
-          <input type="text" id="name-input" value="User"
-            class="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs focus:outline-none focus:border-emerald-500">
+      <div class="space-y-2">
+        <div class="flex items-center justify-between">
+          <label class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Profile (Name & Pincode)</label>
+          <button type="button" onclick="randomizeProfile()" 
+            class="text-[11px] flex items-center gap-1 text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20 px-2.5 py-1 rounded-lg border border-emerald-500/30 transition active:scale-95">
+            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+            🎲 Randomize (All India)
+          </button>
         </div>
-        <div>
-          <label class="block text-xs text-slate-400 mb-1">Pincode</label>
-          <input type="text" id="pin-input" value="110001" maxlength="6"
-            class="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs focus:outline-none focus:border-emerald-500">
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-[11px] text-slate-400 mb-1">Random Name</label>
+            <input type="text" id="name-input" value="Rahul Sharma"
+              class="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs font-medium focus:outline-none focus:border-emerald-500 text-white transition">
+          </div>
+          <div>
+            <label class="block text-[11px] text-slate-400 mb-1">Random PIN (India)</label>
+            <input type="text" id="pin-input" value="110001" maxlength="6"
+              class="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs font-medium focus:outline-none focus:border-emerald-500 text-white transition">
+          </div>
         </div>
       </div>
 
@@ -305,12 +321,12 @@ HTML_TEMPLATE = """
     <!-- Step 2: Enter OTP -->
     <div id="step-otp" class="hidden space-y-4 pt-2 border-t border-slate-800/80">
       <div class="p-3 bg-emerald-500/10 border border-emerald-500/20 rounded-xl text-xs text-emerald-400">
-        ✅ OTP sent to <span id="target-mobile" class="font-bold"></span>! Enter the 4-character code below:
+        ✅ OTP भेजा गया <span id="target-mobile" class="font-bold"></span> पर! 4-अक्षरों वाला कोड नीचे डालें:
       </div>
 
       <div>
         <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">4-Character Code (OTP)</label>
-        <input type="text" id="otp-input" maxlength="6" placeholder="e.g. 4D56"
+        <input type="text" id="otp-input" maxlength="6" placeholder="उदा. 4D56"
           class="w-full px-4 py-3 bg-slate-950 border border-slate-800 rounded-xl text-center text-2xl font-mono uppercase font-bold tracking-widest focus:outline-none focus:border-emerald-500 text-white transition">
       </div>
 
@@ -325,7 +341,7 @@ HTML_TEMPLATE = """
     <div id="step-result" class="hidden space-y-4 pt-2 border-t border-slate-800/80">
       <div class="p-4 bg-emerald-500/10 border border-emerald-500/20 rounded-2xl text-center space-y-2">
         <div class="text-3xl">🎉</div>
-        <div class="text-lg font-bold text-emerald-400">Process Completed!</div>
+        <div class="text-lg font-bold text-emerald-400">प्रक्रिया पूरी हुई!</div>
         <div id="result-badge" class="inline-block px-4 py-1.5 bg-amber-500/20 border border-amber-500/30 text-amber-300 text-base font-bold rounded-xl font-mono">
           -
         </div>
@@ -350,6 +366,46 @@ HTML_TEMPLATE = """
   <script>
     let currentSession = null;
 
+    const RANDOM_PROFILES = [
+      { name: "Rahul Sharma", pin: "110001", city: "New Delhi" },
+      { name: "Priya Patel", pin: "380001", city: "Ahmedabad" },
+      { name: "Amit Verma", pin: "226001", city: "Lucknow" },
+      { name: "Sneha Reddy", pin: "500001", city: "Hyderabad" },
+      { name: "Vikram Singh", pin: "302001", city: "Jaipur" },
+      { name: "Pooja Das", pin: "700001", city: "Kolkata" },
+      { name: "Rohan Iyer", pin: "600001", city: "Chennai" },
+      { name: "Ananya Deshmukh", pin: "400001", city: "Mumbai" },
+      { name: "Deepak Joshi", pin: "411001", city: "Pune" },
+      { name: "Suresh Nair", pin: "682001", city: "Kochi" },
+      { name: "Kavita Yadav", pin: "800001", city: "Patna" },
+      { name: "Manish Mishra", pin: "452001", city: "Indore" },
+      { name: "Aakash Jena", pin: "751001", city: "Bhubaneswar" },
+      { name: "Gaurav Malhotra", pin: "160017", city: "Chandigarh" },
+      { name: "Swati Choudhary", pin: "342001", city: "Jodhpur" },
+      { name: "Arjun Sen", pin: "781001", city: "Guwahati" },
+      { name: "Megha Gupta", pin: "201301", city: "Noida" },
+      { name: "Kunal Mehra", pin: "122001", city: "Gurugram" },
+      { name: "Divya Pillai", pin: "695001", city: "Thiruvananthapuram" },
+      { name: "Harish Kumar", pin: "560001", city: "Bengaluru" },
+      { name: "Rohit Bansal", pin: "141001", city: "Ludhiana" },
+      { name: "Sunita Mohanty", pin: "753001", city: "Cuttack" },
+      { name: "Aditya Roy", pin: "834001", city: "Ranchi" },
+      { name: "Nitin Chauhan", pin: "248001", city: "Dehradun" }
+    ];
+
+    function randomizeProfile() {
+      const idx = Math.floor(Math.random() * RANDOM_PROFILES.length);
+      const chosen = RANDOM_PROFILES[idx];
+      document.getElementById("name-input").value = chosen.name;
+      document.getElementById("pin-input").value = chosen.pin;
+      log(`🎲 Randomized: ${chosen.name} | PIN: ${chosen.pin} (${chosen.city})`);
+    }
+
+    // Auto-randomize on page launch
+    window.addEventListener("DOMContentLoaded", () => {
+      randomizeProfile();
+    });
+
     function log(msg) {
       const b = document.getElementById("log-box");
       const d = document.createElement("div");
@@ -364,7 +420,7 @@ HTML_TEMPLATE = """
       const pincode = document.getElementById("pin-input").value.trim();
 
       if (!mobile || mobile.length !== 10) {
-        alert("Please enter a valid 10-digit mobile number.");
+        alert("कृपया 10-अंकों का मोबाइल नंबर दर्ज करें।");
         return;
       }
 
@@ -372,7 +428,7 @@ HTML_TEMPLATE = """
       const text = document.getElementById("send-btn-text");
       const spinner = document.getElementById("send-spinner");
       btn.disabled = true;
-      text.innerText = "Requesting OTP (Auto-Solving Captcha)...";
+      text.innerText = "Requesting OTP (Auto-Solving Security)...";
       spinner.classList.remove("hidden");
       log(`Triggering OTP dispatch for +91 ${mobile}...`);
 
@@ -385,7 +441,7 @@ HTML_TEMPLATE = """
         const data = await res.json();
         if (data.success) {
           currentSession = data;
-          log(`✅ OTP Sent! UserKey: ${data.userKey}`);
+          log(`✅ OTP भेजा गया! UserKey: ${data.userKey}`);
           document.getElementById("target-mobile").innerText = mobile;
           document.getElementById("step-otp").classList.remove("hidden");
           document.getElementById("otp-input").focus();
@@ -406,7 +462,7 @@ HTML_TEMPLATE = """
     async function verifyAndSpin() {
       const otp = document.getElementById("otp-input").value.trim();
       if (!otp) {
-        alert("Please enter the OTP.");
+        alert("कृपया OTP दर्ज करें।");
         return;
       }
 
@@ -457,7 +513,8 @@ HTML_TEMPLATE = """
       document.getElementById("step-otp").classList.add("hidden");
       document.getElementById("otp-input").value = "";
       document.getElementById("mobile-input").value = "";
-      log("Ready for next mobile number.");
+      randomizeProfile();
+      log("Ready for next mobile number. Profile randomized.");
     }
   </script>
 </body>
@@ -465,6 +522,5 @@ HTML_TEMPLATE = """
 """
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5050))
-    print(f"[SERVER] Automation Hub running on http://127.0.0.1:{port}")
-    app.run(host="0.0.0.0", port=port)
+    print("[SERVER] Automation Hub running on http://127.0.0.1:5050")
+    app.run(host="0.0.0.0", port=5050)
